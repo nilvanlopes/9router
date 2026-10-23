@@ -1,0 +1,55 @@
+name: ninerouter
+
+services:
+  9router:
+    image: local/9router:0.5.104
+    build:
+      context: .
+      target: runtime
+    user: "1000:1000"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 30s
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET no arquivo 9router/.env}
+      INITIAL_PASSWORD: ${INITIAL_PASSWORD:?Configure INITIAL_PASSWORD no arquivo 9router/.env}
+      API_KEY_SECRET: ${API_KEY_SECRET:?Configure API_KEY_SECRET no arquivo 9router/.env}
+      MACHINE_ID_SALT: ${MACHINE_ID_SALT:?Configure MACHINE_ID_SALT no arquivo 9router/.env}
+      AUTH_COOKIE_SECURE: "false"
+      ENABLE_REQUEST_LOGS: "false"
+      OBSERVABILITY_ENABLED: "false"
+      BASE_URL: http://127.0.0.1:20128
+      NEXT_PUBLIC_BASE_URL: http://9router.localnetwork
+      TUNNEL_DASHBOARD_ORIGIN: http://9router.localnetwork
+    volumes:
+      - data:/app/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+      - /app/.next/cache:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+    networks:
+      traefik-local:
+        aliases:
+          - 9router
+    labels:
+      traefik.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  traefik-local:
+    external: true
+
+volumes:
+  data:
+    name: ninerouter_data
