@@ -68,5 +68,6 @@ USER node:node
 EXPOSE 20128
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD ["node", "-e", "fetch('http://127.0.0.1:20128/api/health', {signal: AbortSignal.timeout(4000)}).then(async r => {if (!r.ok || (await r.json()).ok !== true) process.exit(1)}).catch(() => process.exit(1))"]
-ENTRYPOINT ["node"]
+# Swarm ignores security_opt; enforce PR_SET_NO_NEW_PRIVS before Node and children.
+ENTRYPOINT ["setpriv", "--no-new-privs", "node"]
 CMD ["custom-server.js"]

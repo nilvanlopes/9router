@@ -20,8 +20,9 @@ o túnel pelo dashboard autenticado em `.localnetwork`.
 
 ## Preparação e execução
 
-A rede externa `traefik-local` deve existir e permitir containers Compose
-(`attachable=true`). O ambiente já usa uma rede overlay com essas propriedades.
+O serviço roda no Docker Swarm, stack `ninerouter`, serviço `ninerouter_9router`.
+A rede overlay externa `traefik-local` deve existir. O volume local existente
+`ninerouter_data` é externo ao stack e precisa estar neste nó.
 Se necessário, na raiz do repositório: `make setup-traefik-local-network`.
 
 Gere o `.env` local uma única vez, sem imprimir segredos nem sobrescrever um
@@ -39,8 +40,7 @@ with os.fdopen(fd, 'w') as f:
     for key in keys:
         f.write(f'{key}={secrets.token_hex(32)}\n')
 PY
-docker compose config --quiet
-docker compose up -d --build --wait
+./deploy.py
 ```
 
 Ou, depois de criar o `.env`, na raiz: `make deploy-9router`.
@@ -69,7 +69,7 @@ logado.
 
 O ajuste em `patches/` permite as operações de ativar e desativar o túnel
 Cloudflare quando o pedido vem do endereço configurado em
-`TUNNEL_DASHBOARD_ORIGIN` e tem uma sessão válida do dashboard. No Compose,
+`TUNNEL_DASHBOARD_ORIGIN` e tem uma sessão válida do dashboard. No stack,
 esse endereço é `http://9router.localnetwork`. Ele precisa corresponder ao
 endereço usado no navegador, incluindo `http` ou `https` e a porta, se houver.
 
@@ -84,7 +84,7 @@ necessário revisar o ajuste. Para aplicar a configuração nesta instalação:
 
 ```bash
 cd /home/pyu/docker/9router
-docker compose up -d --build --wait
+./deploy.py
 ```
 
 Depois, recarregue o painel. A configuração permite usar os botões; a criação
@@ -99,13 +99,15 @@ O hardening não torna a aplicação livre de vulnerabilidades.
 - Runtime com `/bin/sh`, sem npm, Yarn, compilador ou Python; o build conserva
   essas ferramentas apenas nos estágios intermediários.
 - UID/GID 1000, código pertencente a root, filesystem somente leitura,
-  capabilities removidas e `no-new-privileges`.
+  capabilities removidas e `no-new-privileges`. O entrypoint executa
+  `setpriv --no-new-privs node`, pois o Swarm não aplica `security_opt`.
+  A aplicação e seus filhos herdam `NoNewPrivs: 1`; o `docker-init` pode ter 0.
 - Volume nomeado `ninerouter_data` em `/app/data`, criado com dono 1000:1000 e
   modo 0700. O caminho alternativo `~/.9router` aponta ao mesmo volume.
   Não há inicialização como root nem `chown` a cada partida. Um volume importado
   precisa manter esse UID/GID.
 - Somente dados e os tmpfs de `/tmp` e do cache Next.js são graváveis. Limites
-  de memória, CPU, processos e rotação de logs no Compose.
+  de memória (1 GiB), CPU (1), processos (256) e rotação de logs no Swarm.
 - Nenhuma porta publicada, nenhum Docker socket montado. Somente a rede
   `traefik-local`, com saída para os provedores de IA. Outros containers dessa
   rede também podem conectar ao backend; a allowlist é aplicada no Traefik.
@@ -121,25 +123,68 @@ existe nas configurações do dashboard. O login do dashboard fica habilitado
 por padrão. Operações upstream limitadas a localhost, como ferramentas MITM,
 não são liberadas pelo proxy.
 
-Este serviço usa **Docker Compose local**, conectado à rede compartilhada do
-Swarm. `docker stack deploy` ignora o build e não aplica todas as opções de
-segurança deste Compose. Não use esse comando para este arquivo.
+O `deploy.py` faz o build separado antes de `docker stack deploy`, carrega o
+`.env` explicitamente com o parser do Compose e fixa o placement ao ID deste nó,
+que contém o volume local. A imagem é local: não é enviada a um registry e não
+pode ser agendada em outro nó sem transferir a imagem e os dados.
+
+O formato de stack deste Docker não aceita `deploy.resources.limits.pids`.
+Por isso o arquivo prepara o serviço com zero réplicas e o script aplica
+`--limit-pids 256 --replicas 1` na mesma atualização. Há uma breve parada em
+cada deploy; o script espera a tarefa anterior parar antes de iniciar a nova.
+Nunca execute `docker stack deploy` isoladamente: ele deixará o serviço parado.
+Os tmpfs usam volumes do driver `local` com `type=tmpfs`, porque o stack
+descarta a sintaxe curta `services.tmpfs`. Os mounts efetivos conservam
+`noexec,nosuid,nodev`, tamanhos 128/64 MiB e UID/GID 1000 no cache privado;
+os metadados dos volumes permanecem no Docker; o conteúdo temporário fica
+separado dos dados persistentes e desaparece ao desmontar a última tarefa.
+As atualizações e rollbacks usam `stop-first` para evitar dois escritores SQLite.
+O script recusa deploy enquanto um container fora do serviço usa o volume.
+Se a ativação falhar, consulte as tarefas: o rollback nativo pode voltar à
+etapa intermediária de zero réplicas. Corrija a imagem/configuração e execute
+o deploy novamente, ou use o rollback da migração abaixo.
 
 ## Operação
 
 ```bash
-cd /home/pyu/docker/9router
-docker compose ps
-docker compose logs -f --tail=100
-docker compose exec 9router /bin/sh
-docker compose restart
-docker compose down
+cd /home/pyu/docker
+make deploy-9router
+make logs-9router
+make restart-9router
+docker service ls --filter name=ninerouter
+docker service ps --no-trunc ninerouter_9router
+# Shell na tarefa deste nó:
+docker exec -it "$(docker ps -q --filter label=com.docker.swarm.service.name=ninerouter_9router)" /bin/sh
+# Parar e iniciar mantendo dados e o limite de processos:
+docker service scale ninerouter_9router=0
+docker service scale ninerouter_9router=1
+# Remover o serviço, preservando o volume externo:
+docker stack rm ninerouter
 ```
 
-`down` preserva o volume. `down -v` apaga credenciais e banco de dados.
-Faça backup consistente com o serviço parado; guarde o volume inteiro e o `.env`.
-Atualizações devem ser feitas pelo rebuild da imagem, pois a aplicação não
-pode alterar o próprio código em runtime.
+`restart-9router` recria a tarefa no Swarm com a configuração existente.
+Para reconstruir e publicar alterações, use `make deploy-9router`.
+Não inicie o antigo container Compose enquanto a réplica Swarm estiver ativa.
+Nunca remova `ninerouter_data`: ele contém credenciais e banco de dados.
+Faça backup consistente com a réplica em zero e guarde todo o volume e `.env`.
+Atualizações precisam reconstruir a imagem, pois o runtime não altera o código.
+
+A migração de 26/10/2026 preservou o container Compose parado
+`ninerouter-9router-1`, a imagem `local/9router:pre-swarm-20261026` e um backup
+consistente em `backups/swarm-migration-20261026T.../`, com `.env`, Compose
+anterior, inspect privado e `data.tar`. Para rollback imediato:
+
+```bash
+docker service scale ninerouter_9router=0
+# Espere não haver tarefas em execução (incluindo tarefas em shutdown):
+docker ps --filter label=com.docker.swarm.service.name=ninerouter_9router
+docker start ninerouter-9router-1
+```
+
+O container parado continua referenciando sua imagem original. Esse rollback
+usa os dados atuais do volume; restaurar `data.tar` só é necessário se os dados
+também precisarem voltar ao instante do backup, sempre com todos os escritores
+parados. Não execute simultaneamente o serviço e o container legado.
 
 Para atualizar a versão, revise a release, o commit, o SHA-256 do arquivo,
 o manifesto e os arquivos necessários ao runtime. Regenere o lockfile usando
@@ -161,7 +206,7 @@ Build e testes da v0.5.104 realizados em Linux amd64: imagem com aproximadamente
 O runtime usa somente o Next.js incluído pelo tracing standalone, sem copiar
 uma segunda instalação completa do framework.
 
-Um container temporário, sem portas publicadas e com as restrições do Compose,
+Um container temporário, sem portas publicadas e com as restrições equivalentes de runtime,
 validou o módulo nativo SQLite, o login, o acesso autenticado às configurações,
 a criação de API key e a listagem de modelos com uma chave válida. Chamadas
 remotas sem chave ou com chave inválida retornaram 401. Também foram verificados
@@ -171,3 +216,26 @@ recriar o container. `/api/version` retornou `currentVersion: "0.5.104"` e
 `hasUpdate: false`.
 O container e o volume de teste foram removidos. Chamadas a provedores reais
 dependem das credenciais configuradas depois do deploy.
+
+## Validação da migração Swarm
+
+A migração de 26/10/2026 foi validada com serviço 1/1 saudável, sem portas
+publicadas, placement neste nó e volume externo original. Na tarefa real:
+UID 1000, rootfs somente leitura, capabilities zeradas, `NoNewPrivs: 1` no
+Node e cgroup de processos 256. Os mounts tmpfs conservaram
+`noexec,nosuid,nodev`, tamanhos 128/64 MiB e cache 1000:1000 modo 0700.
+A escrita no código foi rejeitada e os dois tmpfs aceitaram escrita.
+
+O alias `9router` resolveu somente para o VIP do serviço; a saúde via alias e
+via Traefik respondeu 200. Login retornou 200; `/v1/models` retornou 200 com a
+chave existente (53 modelos) e 401 sem chave ou com chave inválida.
+O controle do túnel retornou 403 sem sessão, sem Origin ou com Origin alheio,
+e 200 para desativação autenticada de um túnel que já estava desligado.
+`enabled`, `settingsEnabled` e `running` continuaram falsos, com `shortId` e
+URL pública preservados. Nenhuma chamada paga foi feita aos provedores.
+
+Após redeploy e recriação pelo alvo `restart-9router`, os dados persistiram,
+os tmpfs foram esvaziados e o limite 256 permaneceu. O SQLite passou
+`quick_check`; as contagens do backup e do serviço foram iguais, incluindo
+3 conexões de provedores, 1 API key e 1 combo. Login, API e túnel foram
+verificados novamente na tarefa recriada. O container Compose permanece parado.

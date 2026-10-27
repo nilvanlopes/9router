@@ -1,22 +1,13 @@
-name: ninerouter
+version: "3.8"
 
 services:
   9router:
     image: local/9router:0.5.104
-    build:
-      context: .
-      target: runtime
     user: "1000:1000"
     init: true
-    restart: unless-stopped
     read_only: true
     cap_drop:
       - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 256
-    mem_limit: 1g
-    cpus: 1.0
     stop_grace_period: 30s
     environment:
       JWT_SECRET: ${JWT_SECRET:?Configure JWT_SECRET no arquivo 9router/.env}
@@ -31,15 +22,46 @@ services:
       TUNNEL_DASHBOARD_ORIGIN: http://9router.localnetwork
     volumes:
       - data:/app/data
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
-      - /app/.next/cache:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+      - type: volume
+        source: runtime-tmp
+        target: /tmp
+        volume:
+          nocopy: true
+      - type: volume
+        source: next-cache
+        target: /app/.next/cache
+        volume:
+          nocopy: true
     networks:
       traefik-local:
         aliases:
           - 9router
     labels:
       traefik.enable: "false"
+    deploy:
+      # deploy.py first prepares the stopped service, then applies the PID limit.
+      replicas: 0
+      placement:
+        constraints:
+          - node.id == ${NINEROUTER_NODE_ID:?Use ./deploy.py}
+      labels:
+        traefik.enable: "false"
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 60s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+        monitor: 60s
     logging:
       driver: json-file
       options:
@@ -52,4 +74,18 @@ networks:
 
 volumes:
   data:
+    external: true
     name: ninerouter_data
+  # Stack silently drops service.tmpfs; local-driver tmpfs preserves all flags.
+  runtime-tmp:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: rw,noexec,nosuid,nodev,size=128m,mode=1777
+  next-cache:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
